@@ -27,6 +27,21 @@ Since the txid space is insufficient in practical systems, PostgreSQL treats the
 
 ![](https://user-images.githubusercontent.com/17776979/194903908-28157616-a6bf-49c7-98f2-28f5b6b18555.png)
 
+**Transaction wraparound problem**
+
+Assume that tuple `Tuple_1` is inserted with a **txid** of `100`, i.e. the **t_xmin** of `Tuple_1` is `100`. The server has been running for a very long period and `Tuple_1` has not been modified.
+
+The current **txid** is 2.1 billion + 100 and a SELECT command is executed. At this time, `Tuple_1` is visible because **txid** `100` is in the past. Then, the same SELECT command is executed; thus, the current **txid** is 2.1 billion + 101. However, `Tuple_1` is no longer visible because **txid** `100` is in the future. This is the so called transaction wraparound problem in PostgreSQL.
+
+![](https://user-images.githubusercontent.com/17776979/194998664-b3771956-e82d-4740-ae75-8a19252e913a.png)
+
+To deal with this problem, PostgreSQL introduced a concept called frozen txid, and implemented a process called FREEZE.
+
+In PostgreSQL, a frozen txid, which is a special reserved **txid** `2`, is defined such that it is always older than all other txids. In other words, the frozen txid is always inactive and visible.
+
+The freeze process is invoked by the vacuum process. The freeze process scans all table files and rewrites the **t_xmin** of tuples to the **frozen txid** if the **t_xmin** value is older than the current **txid** minus the [vacuum_freeze_min_age](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-VACUUM-FREEZE-MIN-AGE) (the default is 50 million).
+
+
 ## Tuple Structure
 
 A heap tuple comprises three parts, i.e. the HeapTupleHeaderData structure, NULL bitmap, and user data.
@@ -170,3 +185,72 @@ The current transaction attempts to update the target tuple; however, the other 
 **There is no conflict**
 
 When there is no conflict, the current transaction can update the target row.
+
+## Serializable Snapshot Isolation
+
+### Write skew problem
+
+Write skew is the problem when two concurrent transactions each determine what they are writing based on reading a data set which overlaps what the other is writing, you can get a state which could not occur if either had run before the other.
+
+![](https://user-images.githubusercontent.com/17776979/194999902-666afa41-2923-408e-8f69-5291b14e902d.png)
+
+PostgreSQL takes the following strategy for the SSI implementation to prevent write skew:
+
+1. Record all objects (tuples, pages, relations) accessed by transactions as SIREAD locks.
+2. Detect rw-conflicts using SIREAD locks whenever any heap or index tuple is written.
+3. Abort the transaction if a serialization anomaly is detected by checking detected rw-conflicts.
+
+### Implementing SSI in PostgreSQL
+
+PostgreSQL has implemented many functions and data structures. However, here we uses only two data structures to describe the SSI mechanism
+
+- SIREAD locks
+- rw-conflicts,
+
+**Predicate locks (SIREAD lock)**
+
+An SIREAD lock, internally called a predicate lock, is a pair of an object and (virtual) txids that store information about who has accessed which object.
+
+For example, if txid 100 reads Tuple_1 of the given table, an SIREAD lock `{Tuple_1, {100}}` is created. If another transaction, e.g. txid 101, reads Tuple_1, the SIREAD lock is updated to `{Tuple_1, {100,101}}`.
+
+Note that a SIREAD lock is also created when an index page is read.
+
+SIREAD lock has three levels: `tuple`, `page`, and `relation`.
+
+If the SIREAD locks of all tuples within a single page are created, they are aggregated into a single SIREAD lock for that page, and all SIREAD locks of the associated tuples are released (removed), to reduce memory space. The same is true for all pages that are read.
+
+When creating an SIREAD lock for an index, the page level SIREAD lock is created from the beginning.
+
+When using sequential scan, a relation level SIREAD lock is created from the beginning regardless of the presence of indexes and/or WHERE clauses. Note that, in certain situations, this implementation can cause false-positive detections of serialization anomalies.
+
+Predicate locks are not always released immediately on completion of the transaction. It only releases until all concurrent transactions commit
+
+**rw-conflicts**
+
+A rw-conflict is a triplet of an SIREAD lock and two txids that reads and writes the SIREAD lock. The CheckTargetForConflictsIn function is invoked whenever either an INSERT, UPDATE or DELETE command is executed in SERIALIZABLE mode, and it creates rw-conflicts when detecting conflicts by checking SIREAD locks. For example, assume that txid 100 reads Tuple_1 and then txid 101 updates Tuple_1. In this case, the CheckTargetForConflictsIn function, invoked by the UPDATE command in txid 101, detects a rw-conflict with Tuple_1 between txid 100 and 101 then creates a rw-conflict `{r=100, w=101, {Tuple_1}}`
+
+### How SSI Performs
+
+Transactions Tx_A and Tx_B execute the following commands:
+
+![](https://user-images.githubusercontent.com/17776979/195002029-0d15a5f1-0dd6-4db3-894b-5b7f5330e2fe.png)
+
+Assume that all commands use index scan. Therefore, when the commands are executed, they read both heap tuples and index pages.
+
+The image below shows how PostgreSQL detects and resolves the Write-Skew anomaly described in the above scenario.
+
+![](https://user-images.githubusercontent.com/17776979/195002065-3c83e262-fb44-4072-994c-fb24281049b3.png)
+
+### False-Positive Serialization Anomalies
+
+Scenario where false-positive serialization anomaly occurs.
+
+![](https://user-images.githubusercontent.com/17776979/195002465-e52a5c32-4f13-40b3-afb5-f35c7c1ce015.png)
+
+When using sequential scan, PostgreSQL creates a relation level SIREAD lock. In this case, rw-conflicts C1 and C2, which are associated with the tbl's SIREAD lock, are created, and they create a cycle in the precedence graph. Thus, a false-positive Write-Skew anomaly is detected.
+
+![](https://user-images.githubusercontent.com/17776979/195002535-5ba45776-4b19-4e40-9f55-fa975e0b35c4.png)
+
+Even when using index scan, if both transactions Tx_A and Tx_B get the same index SIREAD lock, PostgreSQL detects a false-positive anomaly.
+
+![](https://user-images.githubusercontent.com/17776979/195002557-9f2c58f4-1d8e-4371-900a-90fcb62d44a7.png)
