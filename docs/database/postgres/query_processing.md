@@ -180,3 +180,11 @@ SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
 ```
+
+## seq_page_cost and random_page_cost
+
+The default values of `seq_page_cost` and `random_page_cost` are `1.0` and `4.0`, respectively. This means that PostgeSQL assumes that the random scan is four times slower than the sequential scan; that is, obviously, the default value of PostgreSQL is based on using HDDs.
+
+On the other hand, in recent days, the default value of `random_page_cost` is too large because SSDs are mostly used. If the default value of `random_page_cost` is used despite using an SSD, the planner may select ineffective plans. Therefore, when using an SSD, it is better to change the value of `random_page_cost` to `1.0` (not sure this is the correct value).
+
+[This blog](https://amplitude.engineering/how-a-single-postgresql-config-change-improved-slow-query-performance-by-50x-85593b8991b0) reported the problem when using the default value of random_page_cost.
